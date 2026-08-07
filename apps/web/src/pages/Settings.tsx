@@ -14,8 +14,14 @@ import { ProfileManager } from '@/components/settings/ProfileManager';
 import { OnboardingSettings } from '@/components/settings/OnboardingSettings';
 import { ProfileDataSettings } from '@/components/settings/ProfileDataSettings';
 import { SyncSettings } from '@/components/settings/SyncSettings';
+import { addonSettingsTabs } from '@/addons/registry';
 
-const VALID_TABS = ['active-profile', 'manage-profiles', 'app-settings'];
+const VALID_TABS = [
+  'active-profile',
+  'manage-profiles',
+  'app-settings',
+  ...addonSettingsTabs.map((tab) => tab.id),
+];
 
 export default function Settings() {
   const { t } = useLanguage();
@@ -61,6 +67,11 @@ export default function Settings() {
           <TabsTrigger value='app-settings' data-onboarding='settings-app-tab'>
             {t.settings.tabs?.appSettings || 'App Settings'}
           </TabsTrigger>
+          {addonSettingsTabs.map((tab) => (
+            <TabsTrigger key={tab.id} value={tab.id}>
+              {tab.label}
+            </TabsTrigger>
+          ))}
         </TabsList>
 
         {/* Tab 1: Active Profile Settings */}
@@ -94,6 +105,17 @@ export default function Settings() {
           <SyncSettings />
           <DataManagementSettings />
         </TabsContent>
+
+        {/* Add-on contributed tabs */}
+        {addonSettingsTabs.map((tab) => (
+          <TabsContent
+            key={tab.id}
+            value={tab.id}
+            className='space-y-0 sm:space-y-6'
+          >
+            {tab.element}
+          </TabsContent>
+        ))}
       </Tabs>
     </div>
   );

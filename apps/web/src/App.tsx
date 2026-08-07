@@ -34,6 +34,11 @@ import {
 } from './components/onboarding';
 import { SpotlightProvider } from './contexts/SpotlightContext';
 import { MigrationGate } from './components/MigrationGate';
+import {
+  AddonProviders,
+  addonRoutes,
+  addonSyncTransports,
+} from './addons/registry';
 
 // Inner component that can access onboarding context
 function AppContent() {
@@ -63,6 +68,7 @@ function AppContent() {
           <Route path='import' element={<Import />} />
           <Route path='settings' element={<Settings />} />
           <Route path='help' element={<Help />} />
+          {addonRoutes}
           <Route path='*' element={<NotFound />} />
         </Route>
       </Routes>
@@ -157,16 +163,18 @@ function App() {
             <DatabaseProvider>
               <ProfileProvider>
                 <PrivacyProvider>
-                  <SyncProvider>
+                  <SyncProvider transports={addonSyncTransports}>
                     <FilterProvider>
                       <ToastProvider>
                         <ConfirmProvider>
                           <BrowserRouter basename={getRouterBasename()}>
                             <OnboardingProvider>
                               <SpotlightProvider>
-                                <SecurityGate>
-                                  <AppContent />
-                                </SecurityGate>
+                                <AddonProviders>
+                                  <SecurityGate>
+                                    <AppContent />
+                                  </SecurityGate>
+                                </AddonProviders>
                               </SpotlightProvider>
                             </OnboardingProvider>
                           </BrowserRouter>
