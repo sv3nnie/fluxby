@@ -13,11 +13,12 @@ import { Fragment, type ReactNode } from 'react';
 import { Route } from 'react-router-dom';
 import type { SyncTransport } from '@fluxby/core';
 import type { AddonSettingsTab, FluxbyAddon } from './types';
+import { remoteSyncAddon } from './remote-sync';
 
 export type { FluxbyAddon, AddonRoute, AddonSettingsTab } from './types';
 
 /** Every enabled add-on, in display order. */
-export const ADDONS: FluxbyAddon[] = [];
+export const ADDONS: FluxbyAddon[] = [remoteSyncAddon];
 
 /**
  * Composes every add-on's Provider around the app. Renders children untouched
