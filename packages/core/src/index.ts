@@ -32,8 +32,14 @@ export * from './sync-service.js';
 // Sync engine (auto-sync, debouncing, status tracking)
 export * from './sync-engine.js';
 
+// Sync transport abstraction (channel-agnostic)
+export * from './sync-transport.js';
+
 // Peer-to-peer device pairing
 export * from './peer.js';
+
+// Peer-to-peer transport adapter
+export * from './peer-transport.js';
 
 // Enhanced peer sync with heartbeats
 export * from './peer-enhanced.js';

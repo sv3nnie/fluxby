@@ -14,7 +14,6 @@ import {
   ReactNode,
 } from 'react';
 import {
-  createPeerSync,
   type PeerSync,
   type PeerDevice,
   type SyncChange,
@@ -24,6 +23,13 @@ import {
   type SyncStatus,
   type ForceSyncResult,
   formatRelativeTime,
+  createSyncTransportRegistry,
+  type SyncTransport,
+  type SyncTransportHost,
+  type SyncTransportRegistry,
+  createPeerSyncTransport,
+  type PeerSyncTransport,
+  PEER_TRANSPORT_ID,
 } from '@fluxby/core';
 import {
   readFromOPFSSync,
@@ -111,6 +117,11 @@ interface SyncProviderProps {
   onSyncReceived?: (changes: SyncChange<SyncableRow>[]) => void;
   /** Callback when a peer requests sync - should return local changes to send */
   onSyncRequested?: (peerId: string) => Promise<SyncChange<SyncableRow>[]>;
+  /**
+   * Extra sync transports to run alongside the built-in peer-to-peer one.
+   * Changes are pushed to, and pulled from, every registered transport.
+   */
+  transports?: SyncTransport[];
 }
 
 // Generate or retrieve device ID from OPFS cache
@@ -189,6 +200,7 @@ export function SyncProvider({
   children,
   onSyncReceived,
   onSyncRequested,
+  transports,
 }: SyncProviderProps) {
   const [deviceId] = useState(getOrCreateDeviceId);
   const [deviceName, setDeviceNameState] = useState(getDeviceName);
@@ -207,11 +219,27 @@ export function SyncProvider({
   const [syncStatus, setSyncStatus] = useState<SyncStatus>(defaultSyncStatus);
   const [autoSyncEnabled, setAutoSyncEnabledState] =
     useState(getAutoSyncEnabled);
+  // Bumped whenever any transport reports a status change, so the engine's
+  // connected-endpoint count can be recomputed.
+  const [transportStatusVersion, setTransportStatusVersion] = useState(0);
 
   // Ref to track if we've already initialized (prevents StrictMode double-init issues)
   const initRef = useRef(false);
-  const syncRef = useRef<PeerSync | null>(null);
+  const syncRef = useRef<PeerSyncTransport | null>(null);
   const syncEngineRef = useRef<SyncEngine | null>(null);
+
+  // Holds every active transport (peer-to-peer plus any add-on transports).
+  // Stable for the lifetime of the provider so the sync engine can be wired
+  // to it exactly once.
+  const registryRef = useRef<SyncTransportRegistry | null>(null);
+  if (registryRef.current === null) {
+    registryRef.current = createSyncTransportRegistry();
+  }
+
+  // Latest sync callbacks, read through a ref so the transport host does not
+  // need re-creating when the parent passes new function identities.
+  const callbacksRef = useRef({ onSyncReceived, onSyncRequested });
+  callbacksRef.current = { onSyncReceived, onSyncRequested };
 
   // Retry initialization (exported via context but currently internal)
   const _retryInitialization = useCallback(() => {
@@ -248,6 +276,17 @@ export function SyncProvider({
       setSyncStatus(status);
     });
 
+    // Route every outbound sync operation through the transport registry.
+    // The registry is stable, so this is wired once rather than being reset on
+    // each queueChange/queueChanges/forceSync call.
+    const registry = registryRef.current;
+    engine.setPushHandler((changes) => {
+      void registry?.push(changes);
+    });
+    engine.setForceSyncHandler(async (sinceTimestamp) => {
+      await registry?.pull(sinceTimestamp);
+    });
+
     syncEngineRef.current = engine;
 
     return () => {
@@ -257,12 +296,13 @@ export function SyncProvider({
     };
   }, [autoSyncEnabled]);
 
-  // Update sync engine connected peer count when pairedDevices change
+  // Keep the engine's connected-endpoint count in sync with the transports.
+  // Counts every transport, not just peer-to-peer devices.
   useEffect(() => {
-    if (!syncEngineRef.current) return;
-    const connectedCount = pairedDevices.filter((d) => d.isConnected).length;
-    syncEngineRef.current.setConnectedPeers(connectedCount);
-  }, [pairedDevices]);
+    if (!syncEngineRef.current || !registryRef.current) return;
+    const { connectedPeers } = registryRef.current.getAggregateStatus();
+    syncEngineRef.current.setConnectedPeers(connectedPeers);
+  }, [pairedDevices, transportStatusVersion]);
 
   useEffect(() => {
     if (initRef.current && syncRef.current) return;
@@ -270,7 +310,54 @@ export function SyncProvider({
     initRef.current = true;
     let active = true;
 
-    const sync = createPeerSync({
+    const registry = registryRef.current;
+    if (!registry) return;
+
+    // Everything a transport is allowed to call back into. Shared by the
+    // peer-to-peer transport and every add-on transport.
+    const host: SyncTransportHost = {
+      deviceId,
+      onChangesReceived: (changes) => {
+        // Notify the sync engine about incoming changes
+        if (syncEngineRef.current) {
+          syncEngineRef.current.shouldApplyIncomingChanges(changes);
+        }
+        // Call the original handler
+        callbacksRef.current.onSyncReceived?.(changes);
+        // Mark sync complete
+        if (syncEngineRef.current) {
+          syncEngineRef.current.markIncomingSyncComplete();
+        }
+      },
+      onChangesRequested: async (_sinceTimestamp, source) => {
+        // When a remote requests sync, return our local changes.
+        // The caller supplies this callback to fetch changes from the database.
+        if (!active) return [];
+        try {
+          const handler = callbacksRef.current.onSyncRequested;
+          return handler
+            ? await handler(source.peerId ?? source.transportId)
+            : [];
+        } catch (error) {
+          console.error('Error fetching local changes for sync:', error);
+          return [];
+        }
+      },
+      onStatusChanged: () => {
+        if (!active) return;
+        setTransportStatusVersion((v) => v + 1);
+      },
+      onError: (transportId, error) => {
+        if (!active) return;
+        if (transportId === PEER_TRANSPORT_ID) {
+          setLastError(error);
+        } else {
+          console.error(`Sync transport "${transportId}" failed:`, error);
+        }
+      },
+    };
+
+    const peerTransport = createPeerSyncTransport({
       deviceId,
       deviceName,
       onPairingRequest: (name, accept, reject) => {
@@ -282,26 +369,9 @@ export function SyncProvider({
         setPairedDevices((prev) => {
           const updated = [...prev.filter((d) => d.id !== device.id), device];
           savePairedDevices(updated);
-          // Update sync engine connected peers using the updated list
-          if (syncEngineRef.current) {
-            const connectedCount = updated.filter((d) => d.isConnected).length;
-            syncEngineRef.current.setConnectedPeers(connectedCount);
-          }
           return updated;
         });
         setPendingPairingRequest(null);
-      },
-      onSyncReceived: (changes) => {
-        // Notify the sync engine about incoming changes
-        if (syncEngineRef.current) {
-          syncEngineRef.current.shouldApplyIncomingChanges(changes);
-        }
-        // Call the original handler
-        onSyncReceived?.(changes);
-        // Mark sync complete
-        if (syncEngineRef.current) {
-          syncEngineRef.current.markIncomingSyncComplete();
-        }
       },
       onConnectionChange: (peerId, connected) => {
         if (!active) return;
@@ -310,41 +380,30 @@ export function SyncProvider({
             d.peerId === peerId ? { ...d, isConnected: connected } : d
           );
           savePairedDevices(updated);
-          // Update sync engine connected peers
-          if (syncEngineRef.current) {
-            const connectedCount = updated.filter((d) => d.isConnected).length;
-            syncEngineRef.current.setConnectedPeers(connectedCount);
-          }
           return updated;
         });
       },
-      onError: (error) => {
-        if (!active) return;
-        setLastError(error);
-      },
-      onSyncRequested: async (peerId) => {
-        // When a peer requests sync, return our local changes
-        // The caller should provide this callback to fetch changes from the database
-        if (!active) return [];
-        try {
-          const changes = onSyncRequested ? await onSyncRequested(peerId) : [];
-          return changes;
-        } catch (error) {
-          console.error('Error fetching local changes for sync:', error);
-          return [];
-        }
-      },
     });
 
-    syncRef.current = sync;
-    setPeerSync(sync);
+    syncRef.current = peerTransport;
 
-    sync
-      .initialize()
-      .then((peerId) => {
+    const registerAll = async () => {
+      await registry.register(peerTransport);
+      for (const transport of transports ?? []) {
+        await registry.register(transport);
+      }
+      await registry.initializeAll(host);
+    };
+
+    registerAll()
+      .then(() => {
         if (!active) return;
+        setPeerSync(peerTransport.getPeerSync());
         // eslint-disable-next-line no-console
-        console.log('Sync initialized with Peer ID:', peerId);
+        console.log(
+          'Sync initialized with Peer ID:',
+          peerTransport.getPeerSync()?.getPeerId()
+        );
         setIsInitialized(true);
       })
       .catch((err) => {
@@ -357,22 +416,26 @@ export function SyncProvider({
 
     return () => {
       active = false;
-      if (syncRef.current === sync) {
-        sync.destroy();
+      if (syncRef.current === peerTransport) {
+        // Tears down the peer transport and every add-on transport.
+        registry.destroyAll();
         syncRef.current = null;
         initRef.current = false;
+        setPeerSync(null);
         setIsInitialized(false);
       }
     };
-  }, [deviceId, deviceName, onSyncReceived, onSyncRequested, initVersion]);
+    // onSyncReceived/onSyncRequested are intentionally not dependencies: they
+    // are read through callbacksRef, so a parent re-render no longer tears
+    // down live WebRTC connections.
+  }, [deviceId, deviceName, transports, initVersion]);
 
   const retryInit = useCallback(() => {
     setLastError(null);
     setIsInitialized(false);
-    if (syncRef.current) {
-      syncRef.current.destroy();
-      syncRef.current = null;
-    }
+    registryRef.current?.destroyAll();
+    syncRef.current = null;
+    setPeerSync(null);
     initRef.current = false;
     setInitVersion((v) => v + 1);
   }, []);
@@ -461,61 +524,20 @@ export function SyncProvider({
       };
     }
 
-    // Set up push handler to broadcast to all connected devices
-    syncEngineRef.current.setPushHandler((changes) => {
-      if (peerSync) {
-        peerSync.broadcastChanges(changes);
-      }
-    });
-
-    // Set up force sync handler to request from all peers
-    syncEngineRef.current.setForceSyncHandler(async (sinceTimestamp) => {
-      if (peerSync) {
-        const devices = peerSync.getPairedDevices();
-        for (const device of devices) {
-          if (device.isConnected) {
-            peerSync.requestSync(device.id, sinceTimestamp);
-          }
-        }
-      }
-    });
-
+    // Push and force-sync handlers are wired to the transport registry once,
+    // when the engine is created.
     return await syncEngineRef.current.forceSync();
-  }, [peerSync]);
+  }, []);
 
   // Queue a change for auto-sync
-  const queueChange = useCallback(
-    (change: SyncChange<SyncableRow>) => {
-      if (!syncEngineRef.current) return;
-
-      // Set up push handler
-      syncEngineRef.current.setPushHandler((changes) => {
-        if (peerSync) {
-          peerSync.broadcastChanges(changes);
-        }
-      });
-
-      syncEngineRef.current.queueChange(change);
-    },
-    [peerSync]
-  );
+  const queueChange = useCallback((change: SyncChange<SyncableRow>) => {
+    syncEngineRef.current?.queueChange(change);
+  }, []);
 
   // Queue multiple changes for auto-sync
-  const queueChanges = useCallback(
-    (changes: SyncChange<SyncableRow>[]) => {
-      if (!syncEngineRef.current) return;
-
-      // Set up push handler
-      syncEngineRef.current.setPushHandler((changesArray) => {
-        if (peerSync) {
-          peerSync.broadcastChanges(changesArray);
-        }
-      });
-
-      syncEngineRef.current.queueChanges(changes);
-    },
-    [peerSync]
-  );
+  const queueChanges = useCallback((changes: SyncChange<SyncableRow>[]) => {
+    syncEngineRef.current?.queueChanges(changes);
+  }, []);
 
   // Format last synced time
   const formatLastSynced = useCallback(
