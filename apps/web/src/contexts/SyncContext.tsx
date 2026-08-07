@@ -113,8 +113,11 @@ export function useSync() {
 
 interface SyncProviderProps {
   children: ReactNode;
-  /** Callback when sync data is received */
-  onSyncReceived?: (changes: SyncChange<SyncableRow>[]) => void;
+  /**
+   * Callback when sync data is received. Resolve only once the changes are
+   * persisted -- transports use it to decide when a batch may be consumed.
+   */
+  onSyncReceived?: (changes: SyncChange<SyncableRow>[]) => void | Promise<void>;
   /** Callback when a peer requests sync - should return local changes to send */
   onSyncRequested?: (peerId: string) => Promise<SyncChange<SyncableRow>[]>;
   /**
@@ -317,16 +320,20 @@ export function SyncProvider({
     // peer-to-peer transport and every add-on transport.
     const host: SyncTransportHost = {
       deviceId,
-      onChangesReceived: (changes) => {
+      onChangesReceived: async (changes) => {
         // Notify the sync engine about incoming changes
         if (syncEngineRef.current) {
           syncEngineRef.current.shouldApplyIncomingChanges(changes);
         }
-        // Call the original handler
-        callbacksRef.current.onSyncReceived?.(changes);
-        // Mark sync complete
-        if (syncEngineRef.current) {
-          syncEngineRef.current.markIncomingSyncComplete();
+        try {
+          // Awaited so a transport only treats the batch as consumed once the
+          // changes have actually been written.
+          await callbacksRef.current.onSyncReceived?.(changes);
+        } finally {
+          // Mark sync complete
+          if (syncEngineRef.current) {
+            syncEngineRef.current.markIncomingSyncComplete();
+          }
         }
       },
       onChangesRequested: async (_sinceTimestamp, source) => {

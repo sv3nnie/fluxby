@@ -193,7 +193,9 @@ export class RemoteSyncTransport implements SyncTransport {
         }
 
         if (changes.length > 0) {
-          this.host?.onChangesReceived(changes);
+          // Awaited so the cursor only advances once the changes are durably
+          // applied. If this throws, the batch is retried on the next pull.
+          await this.host?.onChangesReceived(changes);
         }
 
         cursor = highestSeq;

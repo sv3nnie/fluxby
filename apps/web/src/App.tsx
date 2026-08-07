@@ -17,7 +17,7 @@ import { FilterProvider } from './contexts/FilterContext';
 import { LanguageProvider, useLanguage } from './contexts/LanguageContext';
 import { DatabaseProvider } from './contexts/DatabaseContext';
 import { ProfileProvider } from './contexts/ProfileContext';
-import { SyncProvider } from './contexts/SyncContext';
+import { SyncDataBridge } from './contexts/SyncDataBridge';
 import { ToastProvider } from './contexts/ToastContext';
 import { ConfirmProvider } from './contexts/ConfirmContext';
 import { PrivacyProvider } from './contexts/PrivacyContext';
@@ -34,11 +34,7 @@ import {
 } from './components/onboarding';
 import { SpotlightProvider } from './contexts/SpotlightContext';
 import { MigrationGate } from './components/MigrationGate';
-import {
-  AddonProviders,
-  addonRoutes,
-  addonSyncTransports,
-} from './addons/registry';
+import { AddonProviders, addonRoutes } from './addons/registry';
 
 // Inner component that can access onboarding context
 function AppContent() {
@@ -163,7 +159,7 @@ function App() {
             <DatabaseProvider>
               <ProfileProvider>
                 <PrivacyProvider>
-                  <SyncProvider transports={addonSyncTransports}>
+                  <SyncDataBridge>
                     <FilterProvider>
                       <ToastProvider>
                         <ConfirmProvider>
@@ -181,7 +177,7 @@ function App() {
                         </ConfirmProvider>
                       </ToastProvider>
                     </FilterProvider>
-                  </SyncProvider>
+                  </SyncDataBridge>
                 </PrivacyProvider>
               </ProfileProvider>
             </DatabaseProvider>

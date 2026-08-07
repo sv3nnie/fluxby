@@ -50,8 +50,14 @@ export interface SyncRequestSource {
 export interface SyncTransportHost {
   /** This device's stable id, for transports that must tag or filter by origin */
   readonly deviceId: string;
-  /** Remote sent us changes to apply locally */
-  onChangesReceived(changes: SyncChange<SyncableRow>[]): void;
+  /**
+   * Remote sent us changes to apply locally.
+   *
+   * Transports that track a durable read position must await this before
+   * advancing it: resolving means the changes are persisted, and rejecting
+   * means they must be delivered again.
+   */
+  onChangesReceived(changes: SyncChange<SyncableRow>[]): void | Promise<void>;
   /**
    * Remote asked what we have changed since `sinceTimestamp`.
    * A `sinceTimestamp` of 0 means "send everything".
