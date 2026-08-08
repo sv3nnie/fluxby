@@ -32,8 +32,38 @@ import { addonSyncTransports } from '@/addons/registry';
 const PUSH_CURSOR_KEY = 'fluxby.syncPushCursor';
 /** Matches the key SyncContext uses, so both agree on this device's identity. */
 const DEVICE_ID_KEY = 'fluxby.deviceId';
+/** The one profile this device syncs. See getSyncProfileId below. */
+const SYNC_PROFILE_KEY = 'fluxby.syncProfileId';
 /** How often to sweep the database for changes that still need pushing. */
 const PUSH_SWEEP_INTERVAL_MS = 15_000;
+
+/**
+ * Resolve which profile takes part in sync, binding it on first use.
+ *
+ * Sync must not simply follow the active profile. Profile ids are generated
+ * per device with crypto.randomUUID and the `profiles` table is not in
+ * SYNCABLE_TABLES, so there is no shared notion of profile identity between
+ * devices: incoming rows are necessarily stamped with the local profile. If
+ * that were whichever profile happened to be selected, switching profiles
+ * would merge two unrelated sets of finances into one.
+ *
+ * Binding once and refusing to sync any other profile keeps the mapping
+ * one-to-one until profiles themselves become syncable.
+ */
+async function getSyncProfileId(
+  activeProfileId: string | null
+): Promise<string | null> {
+  try {
+    const bound = await readFromOPFS<string>(SYNC_PROFILE_KEY);
+    if (bound) return bound;
+    if (!activeProfileId) return null;
+    await writeToOPFS(SYNC_PROFILE_KEY, activeProfileId);
+    return activeProfileId;
+  } catch (error) {
+    console.warn('[sync] Could not resolve the bound sync profile:', error);
+    return null;
+  }
+}
 
 async function loadPushCursor(profileId: string): Promise<number> {
   try {
@@ -63,13 +93,27 @@ export function SyncDataBridge({ children }: { children: ReactNode }) {
   // treats them as effect inputs, and new identities would churn transports.
   const dbRef = useRef(db);
   dbRef.current = db;
-  const profileRef = useRef(activeProfileId);
-  profileRef.current = activeProfileId;
   const deviceIdRef = useRef<string | null>(null);
+  const syncProfileRef = useRef<string | null>(null);
 
+  // Resolve the bound sync profile once the app knows which profile is active.
+  useEffect(() => {
+    let active = true;
+    void getSyncProfileId(activeProfileId).then((bound) => {
+      if (active) syncProfileRef.current = bound;
+    });
+    return () => {
+      active = false;
+    };
+  }, [activeProfileId]);
+
+  /**
+   * Adapter for the bound sync profile, or null when sync must not run --
+   * including when the user has switched to a different profile.
+   */
   const getAdapter = useCallback(() => {
     const database = dbRef.current;
-    const profileId = profileRef.current;
+    const profileId = syncProfileRef.current;
     if (!database || !profileId) return null;
     return createSyncAdapter(database, profileId);
   }, []);
@@ -109,7 +153,7 @@ export function SyncDataBridge({ children }: { children: ReactNode }) {
     >
       <PushSweeper
         isReady={isReady}
-        profileId={activeProfileId}
+        activeProfileId={activeProfileId}
         getAdapter={getAdapter}
       />
       {children}
@@ -125,17 +169,17 @@ export function SyncDataBridge({ children }: { children: ReactNode }) {
  */
 function PushSweeper({
   isReady,
-  profileId,
+  activeProfileId,
   getAdapter,
 }: {
   isReady: boolean;
-  profileId: string | null;
+  activeProfileId: string | null;
   getAdapter: () => ReturnType<typeof createSyncAdapter> | null;
 }) {
   const { queueChanges } = useSync();
 
   useEffect(() => {
-    if (!isReady || !profileId) return;
+    if (!isReady || !activeProfileId) return;
 
     let active = true;
     let running = false;
@@ -149,8 +193,11 @@ function PushSweeper({
       const sweepStartedAt = Date.now();
       try {
         const adapter = getAdapter();
+        // Null when no profile is bound yet, or when the user has switched to
+        // a profile this device does not sync.
         if (!adapter) return;
 
+        const profileId = adapter.getProfileId();
         const since = await loadPushCursor(profileId);
         const changes = await collectLocalChanges(adapter, since);
         if (!active) return;
@@ -171,7 +218,7 @@ function PushSweeper({
       active = false;
       clearInterval(timer);
     };
-  }, [isReady, profileId, getAdapter, queueChanges]);
+  }, [isReady, activeProfileId, getAdapter, queueChanges]);
 
   return null;
 }
