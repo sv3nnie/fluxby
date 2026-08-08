@@ -138,6 +138,8 @@ beforeAll(async () => {
     enabled: true,
     serverUrl: 'https://sync.example.com',
     vaultLabel: 'vault@example.com',
+    // A vault is bound to exactly one local profile.
+    profileId: 'profile-1',
     pollIntervalMs: 60_000,
     keys: await serializeVaultKeys(keys),
   };

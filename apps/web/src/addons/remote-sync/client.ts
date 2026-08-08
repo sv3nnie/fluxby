@@ -17,8 +17,11 @@ export interface RemoteSyncClientOptions {
   serverUrl: string;
   /** Derived, server-visible vault identifier */
   vaultId: string;
-  /** Optional bearer token for servers that require authentication */
-  accessToken?: string;
+  /**
+   * Derived bearer token proving ownership of this vault. The server stores
+   * only its hash, so this authenticates without protecting any data.
+   */
+  authToken: string;
   /** Per-request timeout in ms (default 15000) */
   timeoutMs?: number;
 }
@@ -86,9 +89,7 @@ export class RemoteSyncClient {
         signal: controller.signal,
         headers: {
           'Content-Type': 'application/json',
-          ...(this.options.accessToken
-            ? { Authorization: `Bearer ${this.options.accessToken}` }
-            : {}),
+          Authorization: `Bearer ${this.options.authToken}`,
           ...init.headers,
         },
       });

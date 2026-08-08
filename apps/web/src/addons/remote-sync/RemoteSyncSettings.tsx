@@ -20,7 +20,11 @@ import {
 } from '@/components/ui/card';
 import { Switch } from '@/components/ui/switch';
 import { useToast } from '@/contexts/ToastContext';
+import { useLanguage } from '@/contexts/LanguageContext';
+import { useProfile } from '@/contexts/ProfileContext';
+import { useEncryption } from '@/contexts/EncryptionContext';
 import { deriveVaultKeys, serializeVaultKeys } from './crypto';
+import { remoteSyncStrings } from './strings';
 import {
   DEFAULT_REMOTE_SYNC_CONFIG,
   clearRemoteSyncConfig,
@@ -32,6 +36,10 @@ import { remoteSyncTransport } from './instance';
 
 export function RemoteSyncSettings() {
   const toast = useToast();
+  const { language } = useLanguage();
+  const { activeProfileId, profiles } = useProfile();
+  const { encryptionKey, isUnlocked, isEncryptionEnabled } = useEncryption();
+  const s = remoteSyncStrings(language);
 
   const [config, setConfig] = useState<RemoteSyncConfig>(
     DEFAULT_REMOTE_SYNC_CONFIG
@@ -67,11 +75,16 @@ export function RemoteSyncSettings() {
 
   const handleConnect = useCallback(async () => {
     if (!config.serverUrl.trim() || !config.vaultLabel.trim()) {
-      toast.error('Server URL and vault label are both required');
+      toast.error(s.errServerAndLabel);
       return;
     }
     if (!passphrase) {
-      toast.error('Enter your vault passphrase');
+      toast.error(s.errPassphrase);
+      return;
+    }
+    // The vault is bound to one profile; without one there is nothing to sync.
+    if (!activeProfileId) {
+      toast.error(s.errNoProfile);
       return;
     }
 
@@ -83,7 +96,10 @@ export function RemoteSyncSettings() {
         enabled: true,
         serverUrl: config.serverUrl.trim(),
         vaultLabel: config.vaultLabel.trim(),
-        keys: await serializeVaultKeys(keys),
+        profileId: activeProfileId,
+        // Wrapped with the app's encryption key when one exists, so the stored
+        // key is unreadable while the app is locked.
+        keys: await serializeVaultKeys(keys, isUnlocked ? encryptionKey : null),
       };
 
       await saveRemoteSyncConfig(next);
@@ -96,16 +112,24 @@ export function RemoteSyncSettings() {
       setStatus(result);
 
       if (result.state === 'connected') {
-        toast.success('Connected to remote sync server');
+        toast.success(s.okConnected);
       } else {
-        toast.error(result.lastError ?? 'Could not reach the sync server');
+        toast.error(result.lastError ?? s.errUnreachable);
       }
     } catch (error) {
-      toast.error(error instanceof Error ? error.message : 'Failed to connect');
+      toast.error(error instanceof Error ? error.message : s.errGeneric);
     } finally {
       setIsConnecting(false);
     }
-  }, [config, passphrase, toast]);
+  }, [
+    config,
+    passphrase,
+    toast,
+    s,
+    activeProfileId,
+    encryptionKey,
+    isUnlocked,
+  ]);
 
   const handleDisconnect = useCallback(async () => {
     await clearRemoteSyncConfig();
@@ -114,8 +138,8 @@ export function RemoteSyncSettings() {
     setPassphrase('');
     await remoteSyncTransport.reconfigure(next);
     setStatus(remoteSyncTransport.getStatus());
-    toast.success('Disconnected from remote sync');
-  }, [toast]);
+    toast.success(s.okDisconnected);
+  }, [toast, s]);
 
   const handleToggleEnabled = useCallback(
     async (enabled: boolean) => {
@@ -132,12 +156,16 @@ export function RemoteSyncSettings() {
     return (
       <div className='flex items-center gap-2 p-6 text-muted-foreground'>
         <Loader2 className='h-4 w-4 animate-spin' />
-        Loading remote sync settings...
+        {s.loading}
       </div>
     );
   }
 
   const isSetUp = Boolean(config.keys);
+  const boundProfile = profiles.find((p) => p.id === config.profileId);
+  const activeProfile = profiles.find((p) => p.id === activeProfileId);
+  // Wrapped keys cannot be read while the app is locked.
+  const isKeyLocked = isSetUp && isEncryptionEnabled && !isUnlocked;
 
   return (
     <div className='space-y-6'>
@@ -145,20 +173,17 @@ export function RemoteSyncSettings() {
         <CardHeader>
           <CardTitle className='flex items-center gap-2'>
             <Cloud className='h-5 w-5' />
-            Remote Sync
+            {s.title}
           </CardTitle>
-          <CardDescription>
-            Sync this device with a remote server. Everything is encrypted on
-            this device first, so the server only ever stores unreadable blobs.
-          </CardDescription>
+          <CardDescription>{s.description}</CardDescription>
         </CardHeader>
 
         <CardContent className='space-y-4'>
           <div className='space-y-2'>
-            <Label htmlFor='remote-sync-url'>Server URL</Label>
+            <Label htmlFor='remote-sync-url'>{s.serverUrl}</Label>
             <Input
               id='remote-sync-url'
-              placeholder='https://sync.example.com'
+              placeholder={s.serverUrlPlaceholder}
               value={config.serverUrl}
               disabled={isSetUp}
               onChange={(e) =>
@@ -168,40 +193,42 @@ export function RemoteSyncSettings() {
           </div>
 
           <div className='space-y-2'>
-            <Label htmlFor='remote-sync-label'>Vault label</Label>
+            <Label htmlFor='remote-sync-label'>{s.vaultLabel}</Label>
             <Input
               id='remote-sync-label'
-              placeholder='e.g. your email address'
+              placeholder={s.vaultLabelPlaceholder}
               value={config.vaultLabel}
               disabled={isSetUp}
               onChange={(e) =>
                 setConfig({ ...config, vaultLabel: e.target.value })
               }
             />
-            <p className='text-xs text-muted-foreground'>
-              Used to salt your encryption key. Every device on this vault must
-              use exactly the same label.
-            </p>
+            <p className='text-xs text-muted-foreground'>{s.vaultLabelHint}</p>
           </div>
 
           {!isSetUp && (
-            <div className='space-y-2'>
-              <Label htmlFor='remote-sync-passphrase'>Vault passphrase</Label>
-              <Input
-                id='remote-sync-passphrase'
-                type='password'
-                autoComplete='new-password'
-                value={passphrase}
-                onChange={(e) => setPassphrase(e.target.value)}
-              />
-              <p className='flex items-start gap-1.5 text-xs text-muted-foreground'>
-                <TriangleAlert className='mt-0.5 h-3.5 w-3.5 shrink-0' />
-                <span>
-                  This passphrase never leaves your device and cannot be reset.
-                  If you lose it, the data on the server is unrecoverable.
-                </span>
-              </p>
-            </div>
+            <>
+              <div className='space-y-2'>
+                <Label htmlFor='remote-sync-passphrase'>{s.passphrase}</Label>
+                <Input
+                  id='remote-sync-passphrase'
+                  type='password'
+                  autoComplete='new-password'
+                  value={passphrase}
+                  onChange={(e) => setPassphrase(e.target.value)}
+                />
+                <p className='flex items-start gap-1.5 text-xs text-muted-foreground'>
+                  <TriangleAlert className='mt-0.5 h-3.5 w-3.5 shrink-0' />
+                  <span>{s.passphraseWarning}</span>
+                </p>
+              </div>
+
+              {activeProfile && (
+                <p className='rounded-md bg-muted p-3 text-xs text-muted-foreground'>
+                  {s.profileNotice(activeProfile.name)}
+                </p>
+              )}
+            </>
           )}
 
           <div className='flex flex-wrap items-center gap-2'>
@@ -210,28 +237,35 @@ export function RemoteSyncSettings() {
                 {isConnecting && (
                   <Loader2 className='mr-2 h-4 w-4 animate-spin' />
                 )}
-                {isConnecting ? 'Deriving keys...' : 'Connect'}
+                {isConnecting ? s.connecting : s.connect}
               </Button>
             ) : (
               <Button variant='destructive' onClick={handleDisconnect}>
-                Disconnect
+                {s.disconnect}
               </Button>
             )}
           </div>
+
+          {isSetUp && (
+            <p className='flex items-start gap-1.5 text-xs text-muted-foreground'>
+              <TriangleAlert className='mt-0.5 h-3.5 w-3.5 shrink-0' />
+              <span>{s.rotationWarning}</span>
+            </p>
+          )}
         </CardContent>
       </Card>
 
       {isSetUp && (
         <Card>
           <CardHeader>
-            <CardTitle className='text-base'>Status</CardTitle>
+            <CardTitle className='text-base'>{s.status}</CardTitle>
           </CardHeader>
           <CardContent className='space-y-4'>
             <div className='flex items-center justify-between'>
               <div>
-                <p className='text-sm font-medium'>Sync enabled</p>
+                <p className='text-sm font-medium'>{s.syncEnabled}</p>
                 <p className='text-xs text-muted-foreground'>
-                  Pause without losing your keys or server settings.
+                  {s.syncEnabledHint}
                 </p>
               </div>
               <Switch
@@ -240,14 +274,24 @@ export function RemoteSyncSettings() {
               />
             </div>
 
+            {boundProfile && (
+              <p className='text-xs text-muted-foreground'>
+                {s.profileNotice(boundProfile.name)}
+              </p>
+            )}
+
             <div className='flex items-center gap-2 text-sm'>
               <ShieldCheck className='h-4 w-4 text-muted-foreground' />
-              <span className='text-muted-foreground'>Connection:</span>
+              <span className='text-muted-foreground'>{s.connection}:</span>
               <span className='font-medium'>{status.state}</span>
             </div>
 
-            {status.lastError && (
-              <p className='text-sm text-destructive'>{status.lastError}</p>
+            {isKeyLocked ? (
+              <p className='text-sm text-muted-foreground'>{s.lockedNotice}</p>
+            ) : (
+              status.lastError && (
+                <p className='text-sm text-destructive'>{status.lastError}</p>
+              )
             )}
           </CardContent>
         </Card>

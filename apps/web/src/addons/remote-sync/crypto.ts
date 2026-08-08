@@ -15,10 +15,17 @@
  *   master    = PBKDF2-SHA256(passphrase, salt, 600_000)
  *   encKey    = HKDF(master, info="fluxby-remote-sync:enc")   -> AES-256-GCM
  *   vaultId   = HKDF(master, info="fluxby-remote-sync:vault") -> 32 hex chars
+ *   authToken = HKDF(master, info="fluxby-remote-sync:auth")  -> 64 hex chars
  *
  * The vault id is derived rather than chosen so two devices with the same
  * passphrase and label find the same vault without the server ever learning
  * either one.
+ *
+ * authToken proves vault ownership without any signup flow: the server stores
+ * only its SHA-256 hash, so it can reject writes from anyone who merely
+ * guessed a vault id while never holding anything that decrypts data. It is
+ * derived independently of encKey, so disclosing it cannot reveal the
+ * encryption key.
  */
 
 /** OWASP's current floor for PBKDF2-SHA256. */
@@ -28,20 +35,35 @@ const NONCE_LENGTH = 12; // 96 bits, the GCM standard
 const SALT_PREFIX = 'fluxby-remote-sync:v1:';
 const ENC_INFO = 'fluxby-remote-sync:enc';
 const VAULT_INFO = 'fluxby-remote-sync:vault';
+const AUTH_INFO = 'fluxby-remote-sync:auth';
+const WRAP_INFO = 'fluxby-remote-sync:wrap';
 
 export interface VaultKeys {
   /** AES-GCM key used for every batch payload */
   encKey: CryptoKey;
   /** Public, server-visible vault identifier */
   vaultId: string;
+  /** Bearer token proving ownership of the vault; never protects data */
+  authToken: string;
 }
 
-/** Raw key material, safe to persist locally alongside the local database. */
+/**
+ * Key material at rest.
+ *
+ * `encKeyRaw` is present only in the legacy unwrapped form. Prefer `wrapped`,
+ * which is the AES-GCM encryption of the raw key under a key derived from the
+ * app's own encryption key -- on Tauri and on browsers without OPFS, settings
+ * fall back to base64 in localStorage, where a bare key would be trivially
+ * readable.
+ */
 export interface SerializedVaultKeys {
-  version: 1;
+  version: 1 | 2;
   vaultId: string;
-  /** Base64 raw AES key bytes */
-  encKeyRaw: string;
+  authToken: string;
+  /** v1 only: base64 raw AES key bytes, readable by anyone with disk access */
+  encKeyRaw?: string;
+  /** v2: base64(nonce || ciphertext) of the raw key, wrapped at rest */
+  wrapped?: string;
 }
 
 function toBase64(bytes: Uint8Array): string {
@@ -130,42 +152,146 @@ export async function deriveVaultKeys(
     ['encrypt', 'decrypt']
   );
 
-  const vaultIdBits = await crypto.subtle.deriveBits(
+  const deriveLabel = async (info: string, bits: number) =>
+    toHex(
+      new Uint8Array(
+        await crypto.subtle.deriveBits(
+          {
+            name: 'HKDF',
+            hash: 'SHA-256',
+            salt: new Uint8Array(0),
+            info: new TextEncoder().encode(info),
+          },
+          master,
+          bits
+        )
+      )
+    );
+
+  return {
+    encKey,
+    vaultId: await deriveLabel(VAULT_INFO, 128),
+    authToken: await deriveLabel(AUTH_INFO, 256),
+  };
+}
+
+/**
+ * Wrapping key for key-at-rest, derived from the app's own encryption key so
+ * locking the app also makes the sync key unreadable.
+ */
+async function deriveWrappingKey(masterKey: Uint8Array): Promise<CryptoKey> {
+  const material = await crypto.subtle.importKey(
+    'raw',
+    new Uint8Array(masterKey),
+    'HKDF',
+    false,
+    ['deriveKey']
+  );
+
+  return crypto.subtle.deriveKey(
     {
       name: 'HKDF',
       hash: 'SHA-256',
       salt: new Uint8Array(0),
-      info: new TextEncoder().encode(VAULT_INFO),
+      info: new TextEncoder().encode(WRAP_INFO),
     },
-    master,
-    128
+    material,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
   );
-
-  return { encKey, vaultId: toHex(new Uint8Array(vaultIdBits)) };
 }
 
+/**
+ * Prepare keys for storage. Pass the app's encryption key to wrap them; omit
+ * it only when the app has no password set, in which case there is no secret
+ * to wrap with and the key is stored raw (v1).
+ */
 export async function serializeVaultKeys(
-  keys: VaultKeys
+  keys: VaultKeys,
+  masterKey?: Uint8Array | null
 ): Promise<SerializedVaultKeys> {
-  const raw = await crypto.subtle.exportKey('raw', keys.encKey);
+  const raw = new Uint8Array(await crypto.subtle.exportKey('raw', keys.encKey));
+
+  if (!masterKey || masterKey.length === 0) {
+    return {
+      version: 1,
+      vaultId: keys.vaultId,
+      authToken: keys.authToken,
+      encKeyRaw: toBase64(raw),
+    };
+  }
+
+  const wrappingKey = await deriveWrappingKey(masterKey);
+  const nonce = crypto.getRandomValues(new Uint8Array(NONCE_LENGTH));
+  const ciphertext = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: nonce },
+    wrappingKey,
+    raw
+  );
+
+  const combined = new Uint8Array(nonce.length + ciphertext.byteLength);
+  combined.set(nonce, 0);
+  combined.set(new Uint8Array(ciphertext), nonce.length);
+
   return {
-    version: 1,
+    version: 2,
     vaultId: keys.vaultId,
-    encKeyRaw: toBase64(new Uint8Array(raw)),
+    authToken: keys.authToken,
+    wrapped: toBase64(combined),
   };
 }
 
+/**
+ * Restore keys from storage.
+ *
+ * Throws if a wrapped record is given without the app's encryption key --
+ * which is what happens while the app is locked, and is the point of wrapping.
+ */
 export async function deserializeVaultKeys(
-  stored: SerializedVaultKeys
+  stored: SerializedVaultKeys,
+  masterKey?: Uint8Array | null
 ): Promise<VaultKeys> {
+  let raw: Uint8Array<ArrayBuffer>;
+
+  if (stored.wrapped) {
+    if (!masterKey || masterKey.length === 0) {
+      throw new Error(
+        'Remote sync keys are locked; unlock the app to resume syncing'
+      );
+    }
+    const combined = fromBase64(stored.wrapped);
+    if (combined.length <= NONCE_LENGTH) {
+      throw new Error('Stored sync key is malformed');
+    }
+    const wrappingKey = await deriveWrappingKey(masterKey);
+    raw = new Uint8Array(
+      await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv: combined.slice(0, NONCE_LENGTH) },
+        wrappingKey,
+        combined.slice(NONCE_LENGTH)
+      )
+    );
+  } else if (stored.encKeyRaw) {
+    raw = fromBase64(stored.encKeyRaw);
+  } else {
+    throw new Error('Stored sync key is missing');
+  }
+
   const encKey = await crypto.subtle.importKey(
     'raw',
-    fromBase64(stored.encKeyRaw),
+    raw,
     { name: 'AES-GCM', length: 256 },
     true,
     ['encrypt', 'decrypt']
   );
-  return { encKey, vaultId: stored.vaultId };
+
+  return { encKey, vaultId: stored.vaultId, authToken: stored.authToken };
+}
+
+/** True when a stored record needs the app's encryption key to be read. */
+export function isWrapped(stored: SerializedVaultKeys): boolean {
+  return Boolean(stored.wrapped);
 }
 
 /**

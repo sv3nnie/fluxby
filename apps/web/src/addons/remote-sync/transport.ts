@@ -58,8 +58,20 @@ export class RemoteSyncTransport implements SyncTransport {
   private pulling: Promise<void> | null = null;
   /** This device's id, supplied by the host so our own batches can be skipped. */
   private deviceId = '';
+  /** The app's encryption key, needed to unwrap stored sync keys. */
+  private masterKey: Uint8Array | null = null;
 
   constructor(private options: RemoteSyncTransportOptions = {}) {}
+
+  /**
+   * Supply (or clear) the app's encryption key.
+   *
+   * Stored keys are wrapped with it, so syncing cannot resume while the app is
+   * locked. Clearing drops the connection immediately.
+   */
+  setMasterKey(masterKey: Uint8Array | null): void {
+    this.masterKey = masterKey;
+  }
 
   async initialize(host: SyncTransportHost): Promise<void> {
     this.host = host;
@@ -78,11 +90,11 @@ export class RemoteSyncTransport implements SyncTransport {
     this.setStatus({ state: 'connecting', lastError: null });
 
     try {
-      this.keys = await deserializeVaultKeys(config.keys);
+      this.keys = await deserializeVaultKeys(config.keys, this.masterKey);
       this.client = new RemoteSyncClient({
         serverUrl: config.serverUrl,
         vaultId: this.keys.vaultId,
-        accessToken: config.accessToken,
+        authToken: this.keys.authToken,
       });
 
       await this.client.checkHealth();
@@ -248,6 +260,16 @@ export class RemoteSyncTransport implements SyncTransport {
 
   private reportFailure(error: unknown): void {
     const err = error instanceof Error ? error : new Error(String(error));
+
+    // A locked app is an expected resting state, not a failure to report.
+    if (err.message.includes('locked')) {
+      this.setStatus({
+        state: 'idle',
+        connectedPeers: 0,
+        lastError: err.message,
+      });
+      return;
+    }
     const offline =
       typeof navigator !== 'undefined' && navigator.onLine === false;
 

@@ -23,9 +23,16 @@ export interface RemoteSyncConfig {
   serverUrl: string;
   /** User-chosen label that salts the key derivation; must match across devices */
   vaultLabel: string;
-  /** Optional bearer token for servers that require authentication */
-  accessToken?: string;
-  /** Cached key material; absent until the vault is unlocked once */
+  /**
+   * The local profile this vault syncs.
+   *
+   * Bound once at connect time rather than following the active profile:
+   * profile ids are generated per device and the `profiles` table is not
+   * syncable, so "whatever profile is selected" would merge unrelated
+   * finances into each other on a profile switch.
+   */
+  profileId?: string;
+  /** Cached key material; absent until the vault is set up once */
   keys?: SerializedVaultKeys;
   /** How often to poll the server for new batches */
   pollIntervalMs: number;
@@ -87,6 +94,10 @@ export async function saveCursor(vaultId: string, seq: number): Promise<void> {
 /** True when the config has everything needed to actually sync. */
 export function isConfigured(config: RemoteSyncConfig): boolean {
   return Boolean(
-    config.enabled && config.serverUrl && config.vaultLabel && config.keys
+    config.enabled &&
+    config.serverUrl &&
+    config.vaultLabel &&
+    config.profileId &&
+    config.keys
   );
 }

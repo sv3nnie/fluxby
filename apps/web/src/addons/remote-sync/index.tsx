@@ -9,12 +9,14 @@
 
 import type { FluxbyAddon } from '../types';
 import { RemoteSyncSettings } from './RemoteSyncSettings';
+import { RemoteSyncProvider } from './RemoteSyncProvider';
 import { remoteSyncTransport } from './instance';
 
 export const remoteSyncAddon: FluxbyAddon = {
   id: 'remote-sync',
   name: 'Remote Sync',
   description: 'End-to-end encrypted sync with a remote server you control.',
+  Provider: RemoteSyncProvider,
   settingsTabs: [
     {
       id: 'remote-sync',

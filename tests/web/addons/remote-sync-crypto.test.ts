@@ -5,6 +5,7 @@ import {
   deserializeVaultKeys,
   encryptPayload,
   decryptPayload,
+  isWrapped,
   type VaultKeys,
 } from '@/addons/remote-sync/crypto';
 
@@ -122,20 +123,113 @@ describe('encryptPayload / decryptPayload', () => {
   });
 });
 
+describe('auth token', () => {
+  it('is deterministic for the same credentials', async () => {
+    const again = await deriveVaultKeys(
+      'correct horse battery staple',
+      'sven@example.com'
+    );
+    expect(again.authToken).toBe(keys.authToken);
+    expect(keys.authToken).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it('is independent of the encryption key and vault id', async () => {
+    const raw = await crypto.subtle.exportKey('raw', keys.encKey);
+    const encKeyHex = [...new Uint8Array(raw)]
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+
+    // Disclosing the token to the server must not reveal anything else.
+    expect(keys.authToken).not.toBe(encKeyHex);
+    expect(keys.authToken).not.toContain(keys.vaultId);
+    expect(encKeyHex).not.toContain(keys.authToken);
+  });
+
+  it('differs for a different passphrase', async () => {
+    const other = await deriveVaultKeys(
+      'another passphrase',
+      'sven@example.com'
+    );
+    expect(other.authToken).not.toBe(keys.authToken);
+  });
+});
+
 describe('vault key serialization', () => {
-  it('round-trips through storage and still decrypts', async () => {
+  it('round-trips unwrapped when no app password is set', async () => {
     const payload = await encryptPayload(keys, { hello: 'world' });
 
     const stored = await serializeVaultKeys(keys);
-    const restored = await deserializeVaultKeys(stored);
+    expect(stored.version).toBe(1);
+    expect(isWrapped(stored)).toBe(false);
 
+    const restored = await deserializeVaultKeys(stored);
     expect(restored.vaultId).toBe(keys.vaultId);
+    expect(restored.authToken).toBe(keys.authToken);
     expect(await decryptPayload(restored, payload)).toEqual({ hello: 'world' });
   });
 
   it('stores the key material without the passphrase', async () => {
     const stored = await serializeVaultKeys(keys);
     expect(JSON.stringify(stored)).not.toContain('correct horse');
-    expect(stored.version).toBe(1);
+  });
+
+  it('wraps the key when an app encryption key is supplied', async () => {
+    const masterKey = crypto.getRandomValues(new Uint8Array(32));
+    const stored = await serializeVaultKeys(keys, masterKey);
+
+    expect(stored.version).toBe(2);
+    expect(isWrapped(stored)).toBe(true);
+    // The raw key must not be recoverable from storage alone. This matters on
+    // Tauri, where settings fall back to base64 in localStorage.
+    expect(stored.encKeyRaw).toBeUndefined();
+
+    const raw = new Uint8Array(
+      await crypto.subtle.exportKey('raw', keys.encKey)
+    );
+    expect(stored.wrapped).toBeDefined();
+    expect(atob(stored.wrapped ?? '')).not.toContain(
+      String.fromCharCode(...raw)
+    );
+  });
+
+  it('unwraps and still decrypts with the right app key', async () => {
+    const masterKey = crypto.getRandomValues(new Uint8Array(32));
+    const payload = await encryptPayload(keys, { hello: 'wrapped' });
+
+    const stored = await serializeVaultKeys(keys, masterKey);
+    const restored = await deserializeVaultKeys(stored, masterKey);
+
+    expect(restored.vaultId).toBe(keys.vaultId);
+    expect(await decryptPayload(restored, payload)).toEqual({
+      hello: 'wrapped',
+    });
+  });
+
+  it('refuses to unwrap without the app key, as when the app is locked', async () => {
+    const masterKey = crypto.getRandomValues(new Uint8Array(32));
+    const stored = await serializeVaultKeys(keys, masterKey);
+
+    await expect(deserializeVaultKeys(stored)).rejects.toThrow('locked');
+    await expect(
+      deserializeVaultKeys(stored, new Uint8Array(0))
+    ).rejects.toThrow('locked');
+  });
+
+  it('fails to unwrap with the wrong app key', async () => {
+    const stored = await serializeVaultKeys(
+      keys,
+      crypto.getRandomValues(new Uint8Array(32))
+    );
+    await expect(
+      deserializeVaultKeys(stored, crypto.getRandomValues(new Uint8Array(32)))
+    ).rejects.toThrow();
+  });
+
+  it('still reads legacy v1 records written before wrapping existed', async () => {
+    const payload = await encryptPayload(keys, { legacy: true });
+    const legacy = await serializeVaultKeys(keys);
+
+    const restored = await deserializeVaultKeys(legacy, null);
+    expect(await decryptPayload(restored, payload)).toEqual({ legacy: true });
   });
 });
