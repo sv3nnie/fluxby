@@ -14,9 +14,12 @@ import express, {
   type Response,
 } from 'express';
 import cors from 'cors';
+import { randomUUID } from 'node:crypto';
 import rateLimit from 'express-rate-limit';
 import {
   AuthError,
+  InvalidSnapshotError,
+  NotFoundError,
   QuotaExceededError,
   VaultStore,
   type VaultQuota,
@@ -32,6 +35,12 @@ export interface AppOptions {
   rateLimitWindowMs?: number;
   /** Largest accepted JSON body */
   bodyLimit?: string;
+  /**
+   * Number of reverse proxies in front of the server. Without this every
+   * request appears to come from the proxy and rate limiting throttles all
+   * clients as one.
+   */
+  trustProxy?: number | boolean;
   quota?: VaultQuota;
 }
 
@@ -45,8 +54,11 @@ export function createApp({
   rateLimitMax = 120,
   rateLimitWindowMs = 60_000,
   bodyLimit = '2mb',
+  trustProxy = false,
 }: AppOptions) {
   const app = express();
+
+  if (trustProxy !== false) app.set('trust proxy', trustProxy);
 
   app.use(cors());
   app.use(express.json({ limit: bodyLimit }));
@@ -204,6 +216,130 @@ export function createApp({
     }
   );
 
+  // ---------------------------------------------------------------------
+  // Snapshots
+  // ---------------------------------------------------------------------
+
+  app.get(
+    '/v1/vaults/:vaultId/snapshot',
+    validateVaultId,
+    authenticate,
+    (req: Request, res: Response) => {
+      res.json({ snapshot: store.getSnapshot(req.params.vaultId) });
+    }
+  );
+
+  app.post(
+    '/v1/vaults/:vaultId/snapshots',
+    validateVaultId,
+    authenticate,
+    (req: Request, res: Response) => {
+      const snapshotId = randomUUID();
+      store.beginSnapshot(req.params.vaultId, snapshotId);
+      res.json({ snapshotId });
+    }
+  );
+
+  app.put(
+    '/v1/vaults/:vaultId/snapshots/:snapshotId/chunks/:index',
+    validateVaultId,
+    authenticate,
+    (req: Request, res: Response) => {
+      const index = Number.parseInt(req.params.index, 10);
+      const payload = req.body?.payload;
+
+      if (!Number.isFinite(index) || index < 0) {
+        res
+          .status(400)
+          .json({ error: 'invalid_request', message: 'index must be >= 0' });
+        return;
+      }
+      if (typeof payload !== 'string' || !payload) {
+        res
+          .status(400)
+          .json({ error: 'invalid_request', message: 'payload is required' });
+        return;
+      }
+
+      store.putSnapshotChunk(
+        req.params.vaultId,
+        req.params.snapshotId,
+        index,
+        payload
+      );
+      res.json({ ok: true });
+    }
+  );
+
+  app.post(
+    '/v1/vaults/:vaultId/snapshots/:snapshotId/commit',
+    validateVaultId,
+    authenticate,
+    (req: Request, res: Response) => {
+      const throughSeq = Number.parseInt(
+        String(req.body?.throughSeq ?? ''),
+        10
+      );
+      const chunkCount = Number.parseInt(
+        String(req.body?.chunkCount ?? ''),
+        10
+      );
+      const rowCount = Number.parseInt(String(req.body?.rowCount ?? '0'), 10);
+      const deviceId = String(req.body?.deviceId ?? '');
+
+      if (
+        !Number.isFinite(throughSeq) ||
+        throughSeq < 0 ||
+        !Number.isFinite(chunkCount) ||
+        chunkCount < 0
+      ) {
+        res.status(400).json({
+          error: 'invalid_request',
+          message: 'throughSeq and chunkCount must be non-negative integers',
+        });
+        return;
+      }
+
+      // A snapshot may not claim a position the log has not reached, or every
+      // device restoring from it would skip batches that were never covered.
+      if (throughSeq > store.latestSeq(req.params.vaultId)) {
+        res.status(400).json({
+          error: 'invalid_request',
+          message: 'throughSeq is ahead of the log',
+        });
+        return;
+      }
+
+      store.commitSnapshot(req.params.vaultId, req.params.snapshotId, {
+        throughSeq,
+        chunkCount,
+        rowCount,
+        deviceId,
+      });
+      res.json({ ok: true });
+    }
+  );
+
+  app.get(
+    '/v1/vaults/:vaultId/snapshots/:snapshotId/chunks/:index',
+    validateVaultId,
+    authenticate,
+    (req: Request, res: Response) => {
+      const index = Number.parseInt(req.params.index, 10);
+      const payload = store.getSnapshotChunk(
+        req.params.vaultId,
+        req.params.snapshotId,
+        index
+      );
+
+      if (payload === null) {
+        res.status(404).json({ error: 'not_found', message: 'Unknown chunk' });
+        return;
+      }
+      res.json({ index, payload });
+    }
+  );
+
   app.use((_req, res) => {
     res.status(404).json({ error: 'not_found' });
   });
@@ -216,6 +352,22 @@ export function createApp({
 
       _next: NextFunction
     ) => {
+      if (error instanceof NotFoundError) {
+        res.status(404).json({ error: 'not_found', message: error.message });
+        return;
+      }
+      if (error instanceof InvalidSnapshotError) {
+        res
+          .status(409)
+          .json({ error: 'invalid_snapshot', message: error.message });
+        return;
+      }
+      if (error instanceof QuotaExceededError) {
+        res
+          .status(413)
+          .json({ error: 'quota_exceeded', message: error.message });
+        return;
+      }
       console.error('[sync-server]', error);
       res.status(500).json({ error: 'internal_error' });
     }

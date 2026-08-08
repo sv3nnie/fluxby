@@ -68,16 +68,18 @@ function installServerBridge() {
       const path = target.pathname + target.search;
       const headers = (init?.headers ?? {}) as Record<string, string>;
 
-      const call =
-        init?.method === 'POST'
-          ? request(app)
-              .post(path)
-              .send(JSON.parse(String(init.body)))
-          : request(app).get(path);
+      const method = (init?.method ?? 'GET').toUpperCase();
+      let call =
+        method === 'POST'
+          ? request(app).post(path)
+          : method === 'PUT'
+            ? request(app).put(path)
+            : request(app).get(path);
 
       for (const [key, value] of Object.entries(headers)) {
-        call.set(key, value);
+        call = call.set(key, value);
       }
+      if (init?.body) call = call.send(JSON.parse(String(init.body)));
 
       const res = await call;
       return new Response(JSON.stringify(res.body), {
@@ -343,6 +345,74 @@ describe('two devices sharing a vault', () => {
     deviceA.transport.destroy();
     fresh.transport.destroy();
   });
+
+  it('bootstraps a new device from a snapshot after the log is compacted', async () => {
+    const deviceA = createDevice('device-a', {
+      transactions: [
+        row({ id: 't1', updated_at: 1000 }),
+        row({ id: 't2', updated_at: 2000 }),
+        row({ id: 't3', updated_at: 3000 }),
+      ],
+    });
+    await deviceA.connect();
+    await deviceA.pushAll();
+
+    // Device A snapshots at its own applied cursor, which also compacts the
+    // batches the snapshot stands in for.
+    activeDevice = 'device-a';
+    const created = await deviceA.transport.maybeCreateSnapshot(
+      deviceA.adapter,
+      1
+    );
+    expect(created).not.toBeNull();
+
+    const vaultId = (await deriveVaultKeys(PASSPHRASE, LABEL)).vaultId;
+    // The log really is gone; only the snapshot can serve this data now.
+    expect(store.list(vaultId, 0, 100)).toEqual([]);
+
+    const fresh = createDevice('device-c', { transactions: [] });
+    await fresh.connect();
+
+    expect(fresh.tables.transactions.map((r) => r.id).sort()).toEqual([
+      't1',
+      't2',
+      't3',
+    ]);
+
+    deviceA.transport.destroy();
+    fresh.transport.destroy();
+  }, 30_000);
+
+  it('carries batches written after a snapshot through to a new device', async () => {
+    const deviceA = createDevice('device-a', {
+      transactions: [row({ id: 'before-snapshot', updated_at: 1000 })],
+    });
+    await deviceA.connect();
+    await deviceA.pushAll();
+
+    activeDevice = 'device-a';
+    await deviceA.transport.maybeCreateSnapshot(deviceA.adapter, 1);
+
+    // A change made after the snapshot is an ordinary batch again.
+    deviceA.tables.transactions.push(
+      row({ id: 'after-snapshot', updated_at: 9000 }) as never
+    );
+    activeDevice = 'device-a';
+    const changes = await collectLocalChanges(deviceA.adapter, 5000);
+    await deviceA.transport.push(changes);
+
+    const fresh = createDevice('device-c', { transactions: [] });
+    await fresh.connect();
+
+    // Snapshot plus tail must reconstruct the whole dataset.
+    expect(fresh.tables.transactions.map((r) => r.id).sort()).toEqual([
+      'after-snapshot',
+      'before-snapshot',
+    ]);
+
+    deviceA.transport.destroy();
+    fresh.transport.destroy();
+  }, 30_000);
 
   it('shuts a device out when its passphrase does not match', async () => {
     const deviceA = createDevice('device-a', {

@@ -17,7 +17,24 @@ const app = createApp({
   store,
   rateLimitMax: Number(process.env.SYNC_RATE_LIMIT_MAX ?? 120),
   rateLimitWindowMs: Number(process.env.SYNC_RATE_LIMIT_WINDOW_MS ?? 60_000),
+  // e.g. SYNC_TRUST_PROXY=1 when running behind a single reverse proxy.
+  trustProxy: process.env.SYNC_TRUST_PROXY
+    ? Number(process.env.SYNC_TRUST_PROXY)
+    : false,
 });
+
+// Abandoned snapshot uploads leave chunks no reader can ever see.
+const purgeTimer = setInterval(
+  () => {
+    const removed = store.purgeAbandonedSnapshots();
+    if (removed > 0) {
+      // eslint-disable-next-line no-console
+      console.log(`Purged ${removed} abandoned snapshot(s)`);
+    }
+  },
+  60 * 60 * 1000
+);
+purgeTimer.unref();
 
 const server = app.listen(PORT, () => {
   // eslint-disable-next-line no-console

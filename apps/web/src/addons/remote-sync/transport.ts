@@ -18,6 +18,7 @@ import {
   type SyncTransportStatus,
   type SyncableRow,
 } from '@fluxby/core';
+import type { SyncDatabaseAdapter } from '@fluxby/database';
 import { RemoteSyncClient, RemoteSyncError } from './client';
 import {
   deserializeVaultKeys,
@@ -36,8 +37,22 @@ import {
   REMOTE_SYNC_PROTOCOL_VERSION,
   type RemoteBatchContents,
 } from './protocol';
+import {
+  createSnapshot,
+  restoreSnapshot,
+  shouldCreateSnapshot,
+  type CreateSnapshotResult,
+} from './snapshot';
 
 export const REMOTE_SYNC_TRANSPORT_ID = 'remote-server';
+
+/**
+ * Batches to accumulate past the last snapshot before taking a new one.
+ *
+ * Low enough that a new device never replays a long tail, high enough that
+ * snapshotting stays rare relative to ordinary syncing.
+ */
+export const DEFAULT_SNAPSHOT_THRESHOLD = 500;
 
 export interface RemoteSyncTransportOptions {
   /** Overrides the OPFS-stored config; mainly for tests */
@@ -173,6 +188,27 @@ export class RemoteSyncTransport implements SyncTransport {
 
     try {
       let cursor = await loadCursor(keys.vaultId);
+
+      // Before replaying the log, see whether a snapshot can get us further in
+      // one step. This covers two cases with the same code path: a brand-new
+      // device starting at 0, and a device that fell so far behind that the
+      // batches it still needs have been compacted away.
+      const snapshot = await client.getSnapshot();
+      if (snapshot && snapshot.throughSeq > cursor) {
+        await restoreSnapshot({
+          client,
+          keys,
+          manifest: snapshot,
+          applyChanges: async (changes) => {
+            await this.host?.onChangesReceived(changes);
+          },
+        });
+        // Only advance once every chunk applied; restoreSnapshot throws
+        // otherwise, leaving the cursor where it was so the next pull retries.
+        cursor = snapshot.throughSeq;
+        await saveCursor(keys.vaultId, cursor);
+      }
+
       let hasMore = true;
 
       // The server caps page size, so drain until we reach the head.
@@ -224,6 +260,49 @@ export class RemoteSyncTransport implements SyncTransport {
       }
     } catch (error) {
       if (!this.destroyed) this.reportFailure(error);
+    }
+  }
+
+  /**
+   * Publish a snapshot if the log has grown enough to be worth replacing.
+   *
+   * `throughSeq` is this device's own applied cursor, never the server's
+   * latest sequence: a device that has not applied batch N cannot produce a
+   * snapshot standing in for batch N, and publishing one would drop those rows
+   * for every device that later restores from it.
+   *
+   * Returns null when no snapshot was needed or possible.
+   */
+  async maybeCreateSnapshot(
+    adapter: SyncDatabaseAdapter,
+    threshold = DEFAULT_SNAPSHOT_THRESHOLD
+  ): Promise<CreateSnapshotResult | null> {
+    const client = this.client;
+    const keys = this.keys;
+    if (!client || !keys) return null;
+
+    try {
+      const [snapshot, cursor] = await Promise.all([
+        client.getSnapshot(),
+        loadCursor(keys.vaultId),
+      ]);
+
+      // Only a caught-up device may snapshot, and only once the log has grown.
+      const { latestSeq } = await client.pullBatches(cursor, 1);
+      if (cursor < latestSeq) return null;
+      if (!shouldCreateSnapshot(cursor, snapshot, threshold)) return null;
+
+      return await createSnapshot({
+        adapter,
+        client,
+        keys,
+        deviceId: this.deviceId,
+        throughSeq: cursor,
+      });
+    } catch (error) {
+      // A failed snapshot costs nothing: the log is still authoritative.
+      console.warn('[remote-sync] Snapshot creation failed:', error);
+      return null;
     }
   }
 

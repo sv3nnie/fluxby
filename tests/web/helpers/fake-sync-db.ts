@@ -26,6 +26,31 @@ export function createFakeAdapter(seed: Record<string, SyncableRow[]> = {}) {
         if (!table) return [] as T[];
         const rows = tables[table] ?? [];
 
+        // iterateProfileRows keyset page:
+        //   (updated_at > ? OR (updated_at = ? AND id > ?)) ORDER BY .. LIMIT ?
+        // Must honour ORDER BY and LIMIT, otherwise a test asserting that
+        // paging is memory-bounded would pass against a single huge page.
+        if (/updated_at\s*=\s*\?\s*AND\s+id\s*>/i.test(sql)) {
+          const [, lastUpdatedAt, , lastId, limit] = params as [
+            string,
+            number,
+            number,
+            string,
+            number,
+          ];
+          return [...rows]
+            .sort(
+              (a, b) =>
+                a.updated_at - b.updated_at ||
+                String(a.id).localeCompare(String(b.id))
+            )
+            .filter(
+              (r) =>
+                r.updated_at > lastUpdatedAt ||
+                (r.updated_at === lastUpdatedAt && String(r.id) > lastId)
+            )
+            .slice(0, limit) as T[];
+        }
         // getChangesSince: WHERE profile_id = ? AND updated_at > ?
         if (/updated_at\s*>/.test(sql)) {
           const since = Number(params[1] ?? 0);

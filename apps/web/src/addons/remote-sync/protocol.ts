@@ -61,3 +61,74 @@ export interface RemoteSyncErrorBody {
   error: string;
   message?: string;
 }
+
+// ---------------------------------------------------------------------------
+// Snapshots
+// ---------------------------------------------------------------------------
+
+/**
+ * A snapshot is a complete encrypted copy of every syncable row at one point
+ * in the log, split into independently encrypted chunks.
+ *
+ * It exists so a new device does not have to replay the entire history, and
+ * so the log can be compacted. Chunking keeps peak memory bounded by chunk
+ * size rather than dataset size at both ends, and keeps each upload inside the
+ * server's per-payload limit.
+ *
+ * `throughSeq` is the log position the snapshot is equivalent to. A device
+ * restoring from it continues pulling from that sequence number.
+ */
+export interface SnapshotManifest {
+  snapshotId: string;
+  /** Log position this snapshot is equivalent to */
+  throughSeq: number;
+  chunkCount: number;
+  /** Rows captured, for progress reporting */
+  rowCount: number;
+  createdAt: number;
+  /** Device that produced it, for diagnostics */
+  deviceId: string;
+}
+
+/** Decrypted contents of one snapshot chunk. */
+export interface SnapshotChunkContents {
+  version: typeof REMOTE_SYNC_PROTOCOL_VERSION;
+  index: number;
+  /** Sync changes carried by this chunk */
+  changes: unknown[];
+}
+
+/** POST /v1/vaults/:vaultId/snapshots -> begin an upload */
+export interface BeginSnapshotResponse {
+  snapshotId: string;
+}
+
+/** PUT /v1/vaults/:vaultId/snapshots/:snapshotId/chunks/:index */
+export interface PutSnapshotChunkRequest {
+  payload: string;
+}
+
+/**
+ * POST /v1/vaults/:vaultId/snapshots/:snapshotId/commit
+ *
+ * Publishes the snapshot, replaces any previous one, and compacts batches at
+ * or below `throughSeq`. Until this is called the chunks are invisible, so a
+ * partial upload can never be restored from.
+ */
+export interface CommitSnapshotRequest {
+  throughSeq: number;
+  chunkCount: number;
+  rowCount: number;
+  deviceId: string;
+}
+
+/** GET /v1/vaults/:vaultId/snapshot -> the live snapshot, if any */
+export interface GetSnapshotResponse {
+  snapshot: SnapshotManifest | null;
+}
+
+/** GET /v1/vaults/:vaultId/snapshots/:snapshotId/chunks/:index */
+export interface GetSnapshotChunkResponse {
+  index: number;
+  payload: string;
+}

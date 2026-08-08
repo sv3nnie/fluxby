@@ -111,6 +111,58 @@ export async function collectLocalChanges(
 }
 
 /**
+ * Read every row of the active profile, one page at a time.
+ *
+ * Snapshots have to cover the whole dataset, which for a large history will
+ * not fit in memory. Paging keeps peak usage bounded by `pageSize` regardless
+ * of how much data there is.
+ *
+ * Pagination is keyset rather than OFFSET: it walks (updated_at, id) so that a
+ * row written mid-iteration cannot shift the window and cause another row to
+ * be skipped. Ties on updated_at are common after a bulk import, so id is
+ * required as a second key.
+ */
+export async function* iterateProfileRows(
+  adapter: SyncDatabaseAdapter,
+  pageSize = 500
+): AsyncGenerator<SyncChange<SyncableRow>[]> {
+  const profileId = adapter.getProfileId();
+
+  for (const table of SYNCABLE_TABLES) {
+    let lastUpdatedAt = -1;
+    let lastId = '';
+
+    for (;;) {
+      let rows: DbSyncableRow[];
+      try {
+        rows = await adapter.query<DbSyncableRow>(
+          `SELECT * FROM ${table}
+           WHERE profile_id = ?
+             AND (updated_at > ? OR (updated_at = ? AND id > ?))
+           ORDER BY updated_at ASC, id ASC
+           LIMIT ?`,
+          [profileId, lastUpdatedAt, lastUpdatedAt, lastId, pageSize]
+        );
+      } catch (error) {
+        console.warn(`[sync] Could not page through ${table}:`, error);
+        break;
+      }
+
+      if (rows.length === 0) break;
+
+      const last = rows[rows.length - 1];
+      lastUpdatedAt = last.updated_at;
+      lastId = last.id;
+
+      yield rows.map((row) => ({ table, row: toWireRow(row) }));
+
+      // A short page means the table is exhausted.
+      if (rows.length < pageSize) break;
+    }
+  }
+}
+
+/**
  * Where to move the push cursor after a sweep that started at `sweepStartedAt`.
  *
  * Deliberately not the highest `updated_at` seen: getChangesSince filters on

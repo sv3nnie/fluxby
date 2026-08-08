@@ -55,6 +55,13 @@ function installFakeServer() {
     vi.fn(async (url: string | URL, init?: RequestInit) => {
       const target = new URL(String(url));
 
+      // No snapshot in these tests; the batch log is the only source.
+      if (target.pathname.endsWith('/snapshot')) {
+        return new Response(JSON.stringify({ snapshot: null }), {
+          status: 200,
+        });
+      }
+
       if (target.pathname.endsWith('/v1/health')) {
         if (healthFails) {
           return new Response(JSON.stringify({ error: 'nope' }), {
@@ -308,8 +315,12 @@ describe('RemoteSyncTransport', () => {
     const transport = new RemoteSyncTransport({ config });
     const host = makeHost();
     await transport.initialize(host);
-    const callsAfterInit = (fetch as unknown as { mock: { calls: unknown[] } })
-      .mock.calls.length;
+    const batchFetches = () =>
+      (
+        fetch as unknown as { mock: { calls: [string | URL][] } }
+      ).mock.calls.filter(([url]) => String(url).includes('/batches')).length;
+
+    const before = batchFetches();
 
     await Promise.all([
       transport.pull(0),
@@ -317,11 +328,8 @@ describe('RemoteSyncTransport', () => {
       transport.pull(0),
     ]);
 
-    const added =
-      (fetch as unknown as { mock: { calls: unknown[] } }).mock.calls.length -
-      callsAfterInit;
     // Three callers, one round trip.
-    expect(added).toBe(1);
+    expect(batchFetches() - before).toBe(1);
     transport.destroy();
   });
 

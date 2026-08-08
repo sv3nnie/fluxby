@@ -6,10 +6,16 @@
  */
 
 import type {
+  BeginSnapshotResponse,
+  CommitSnapshotRequest,
+  GetSnapshotChunkResponse,
+  GetSnapshotResponse,
   PullBatchesResponse,
   PushBatchRequest,
   PushBatchResponse,
+  PutSnapshotChunkRequest,
   RemoteSyncErrorBody,
+  SnapshotManifest,
 } from './protocol';
 
 export interface RemoteSyncClientOptions {
@@ -56,10 +62,10 @@ export class RemoteSyncClient {
     payload: string
   ): Promise<PushBatchResponse> {
     const body: PushBatchRequest = { deviceId, payload };
-    return this.request<PushBatchResponse>(
-      `/v1/vaults/${encodeURIComponent(this.options.vaultId)}/batches`,
-      { method: 'POST', body: JSON.stringify(body) }
-    );
+    return this.request<PushBatchResponse>(`${this.vaultPath}/batches`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    });
   }
 
   /** Fetch batches with `seq` greater than `since`. */
@@ -69,7 +75,7 @@ export class RemoteSyncClient {
       limit: String(limit),
     });
     return this.request<PullBatchesResponse>(
-      `/v1/vaults/${encodeURIComponent(this.options.vaultId)}/batches?${query}`,
+      `${this.vaultPath}/batches?${query}`,
       { method: 'GET' }
     );
   }
@@ -77,6 +83,64 @@ export class RemoteSyncClient {
   /** Cheap reachability probe used by the settings UI. */
   async checkHealth(): Promise<void> {
     await this.request<unknown>('/v1/health', { method: 'GET' });
+  }
+
+  // -------------------------------------------------------------------------
+  // Snapshots
+  // -------------------------------------------------------------------------
+
+  /** The live snapshot, or null when the vault has never been snapshotted. */
+  async getSnapshot(): Promise<SnapshotManifest | null> {
+    const { snapshot } = await this.request<GetSnapshotResponse>(
+      `${this.vaultPath}/snapshot`,
+      { method: 'GET' }
+    );
+    return snapshot;
+  }
+
+  /** Reserve a snapshot id. Chunks stay invisible until commit. */
+  async beginSnapshot(): Promise<BeginSnapshotResponse> {
+    return this.request<BeginSnapshotResponse>(`${this.vaultPath}/snapshots`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+  }
+
+  async putSnapshotChunk(
+    snapshotId: string,
+    index: number,
+    payload: string
+  ): Promise<void> {
+    const body: PutSnapshotChunkRequest = { payload };
+    await this.request<unknown>(
+      `${this.vaultPath}/snapshots/${encodeURIComponent(snapshotId)}/chunks/${index}`,
+      { method: 'PUT', body: JSON.stringify(body) }
+    );
+  }
+
+  /** Publish the snapshot and compact the batches it supersedes. */
+  async commitSnapshot(
+    snapshotId: string,
+    request: CommitSnapshotRequest
+  ): Promise<void> {
+    await this.request<unknown>(
+      `${this.vaultPath}/snapshots/${encodeURIComponent(snapshotId)}/commit`,
+      { method: 'POST', body: JSON.stringify(request) }
+    );
+  }
+
+  async getSnapshotChunk(
+    snapshotId: string,
+    index: number
+  ): Promise<GetSnapshotChunkResponse> {
+    return this.request<GetSnapshotChunkResponse>(
+      `${this.vaultPath}/snapshots/${encodeURIComponent(snapshotId)}/chunks/${index}`,
+      { method: 'GET' }
+    );
+  }
+
+  private get vaultPath(): string {
+    return `/v1/vaults/${encodeURIComponent(this.options.vaultId)}`;
   }
 
   private async request<T>(path: string, init: RequestInit): Promise<T> {

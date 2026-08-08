@@ -27,6 +27,7 @@ import { SyncProvider, useSync } from './SyncContext';
 import { useDatabase } from './DatabaseContext';
 import { useProfile } from './ProfileContext';
 import { addonSyncTransports } from '@/addons/registry';
+import { remoteSyncTransport } from '@/addons/remote-sync/instance';
 
 /** High-water mark of what this device has already handed to the sync layer. */
 const PUSH_CURSOR_KEY = 'fluxby.syncPushCursor';
@@ -204,6 +205,11 @@ function PushSweeper({
 
         if (changes.length > 0) queueChanges(changes);
         await savePushCursor(profileId, nextPushCursor(sweepStartedAt, since));
+
+        // Publish a snapshot when the log has grown enough to be worth
+        // replacing. Cheap to ask: it no-ops unless this device is caught up
+        // and the threshold is met.
+        await remoteSyncTransport.maybeCreateSnapshot(adapter);
       } catch (error) {
         console.warn('[sync] Push sweep failed:', error);
       } finally {
