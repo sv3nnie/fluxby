@@ -11,6 +11,7 @@
   "scripts": {
     "dev": "concurrently \"npm run dev -w apps/web\" \"npm run dev -w apps/landing\"",
     "dev:api": "npm run dev -w apps/api",
+    "dev:sync-server": "npm run dev -w apps/sync-server",
     "dev:web": "npm run dev -w apps/web",
     "dev:tauri": "npm run dev -w apps/tauri",
     "dev:all": "concurrently \"npm run dev -w apps/api\" \"npm run dev -w apps/web\" \"npm run dev -w apps/landing\"",
@@ -25,7 +26,7 @@
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write \"**/*.{ts,tsx,js,jsx,json,css,md}\"",
-    "typecheck": "npm run build:packages && npm run typecheck -w apps/web && npm run typecheck -w apps/api",
+    "typecheck": "npm run build:packages && npm run typecheck -w apps/web && npm run typecheck -w apps/api && npm run typecheck -w apps/sync-server",
     "test": "vitest",
     "test:run": "vitest run",
     "test:coverage": "vitest run --coverage",

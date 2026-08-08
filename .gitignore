@@ -66,3 +66,6 @@ apps/tauri/target/
 # Test artifacts
 test-results/
 playwright-report/
+# Remote sync server local database
+apps/sync-server/*.db
+apps/sync-server/*.db-*
